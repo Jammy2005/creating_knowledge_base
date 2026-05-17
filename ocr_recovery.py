@@ -67,6 +67,11 @@ def is_severe(doc):
     if ar < 0.15:   return True    # barely any Arabic
     return False
 
+def is_non_ocr(doc):
+    return doc.get('method') != 'ocr_tesseract'
+
+SELECTORS = {'severe': is_severe, 'non_ocr': is_non_ocr}
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def clean_arabic_text(text):
