@@ -13,6 +13,7 @@ wheels/
 .venv/
 
 # Downloaded PDFs (heavy — don't commit)
+output/
 output/pdfs/
 output/pdfs_cbk/
 
