@@ -1,265 +1,242 @@
 """
-OCR Recovery Script — Arabic Legal PDFs
-=========================================
-Reads output/failed.json, runs Tesseract Arabic OCR on each
-scanned PDF, and appends recovered records to output/corpus.jsonl.
+OCR Re-extraction — Corrupted Corpus Documents
+================================================
+Targets docs already in corpus.jsonl that have garbled/no Arabic text,
+re-extracts them using Tesseract OCR, and replaces the bad records
+in-place. Does NOT create duplicates.
+
+Two passes:
+  1. Find all PDF files for the target IDs (searches all pdfs_* dirs)
+  2. OCR each one, replace the bad record in corpus.jsonl
+
+Targets: all severe docs where word_count > 500 and ar_ratio < 0.15
+(i.e. worth recovering — too small to bother OCR-ing)
 
 Usage:
-  python3 ocr_recovery.py
-  python3 ocr_recovery.py --limit 5     # test first 5
-  python3 ocr_recovery.py --dpi 400     # higher DPI = better quality, slower
+  python3 ocr_reextract.py            # full run
+  python3 ocr_reextract.py --limit 3  # test first 3
+  python3 ocr_reextract.py --dpi 400  # higher quality, slower
+  python3 ocr_reextract.py --dry-run  # show targets without extracting
 """
 
-import os
-import re
-import json
-import argparse
+import re, json, argparse, shutil
 import pytesseract
 from pathlib import Path
 from PIL import Image
 from pdf2image import convert_from_path
 from datetime import datetime
+from urllib.parse import unquote
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OUTPUT_DIR   = Path("output")
 CORPUS_JSONL = OUTPUT_DIR / "corpus.jsonl"
-FAILED_LOG   = OUTPUT_DIR / "failed.json"
-OCR_FAILED   = OUTPUT_DIR / "ocr_failed.json"
+REPORT_FILE  = OUTPUT_DIR / "ocr_reextract_report.json"
+DEFAULT_DPI  = 300
 
-DEFAULT_DPI  = 300   # 300 is good balance of quality vs speed for Arabic
-                     # Use 400 for small/dense text, 200 for speed
+# PDF search dirs — all CBK/MOJ/CMA download folders
+PDF_DIRS = [
+    OUTPUT_DIR / "pdfs",
+    OUTPUT_DIR / "pdfs_cbk",
+    OUTPUT_DIR / "pdfs_moj",
+    OUTPUT_DIR / "pdfs_cma",
+]
+
+# ── Health thresholds (same as corpus_health.py) ─────────────────────────────
+
+def arabic_ratio(text):
+    if not text: return 0
+    arabic = len(re.findall(r'[\u0600-\u06FF]', text))
+    total  = len(re.findall(r'\S', text))
+    return arabic / total if total > 0 else 0
+
+def junk_ratio(text):
+    if not text: return 0
+    junk  = len(re.findall(r'(cid:\d+|\(cid:\d+\)|[^\u0000-\u007F\u0600-\u06FF\s]{4,})', text))
+    words = len(text.split())
+    return junk / words if words > 0 else 0
+
+def is_severe(doc):
+    text = doc.get('text', '')
+    wc   = doc.get('word_count', 0)
+    ar   = arabic_ratio(text)
+    junk = junk_ratio(text)
+    if wc < 500:    return False   # too short to bother OCR-ing
+    if ar < 0.05:   return True    # no Arabic
+    if junk > 0.30: return True    # heavily garbled
+    if ar < 0.15:   return True    # barely any Arabic
+    return False
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def clean_arabic_text(text: str) -> str:
-    if not text:
-        return ""
+def clean_arabic_text(text):
+    if not text: return ""
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return '\n'.join(l.strip() for l in text.splitlines()).strip()
 
+def pdf_filename_from_url(url):
+    """Reconstruct the PDF filename the scraper would have used."""
+    fname = unquote(url.split('/')[-1])
+    fname = re.sub(r'[<>:"/\\|?*\u200b\+]', '_', fname)
+    return fname
 
-def extract_year(name: str):
-    m = re.search(r'(?:لسنة|لسنه|سنة|سنه)\s*(\d{4})', name)
-    if m: return m.group(1)
-    m = re.search(r'\b(19\d{2}|20\d{2})\b', name)
-    return m.group(1) if m else None
+def find_pdf(url):
+    """Search all pdf dirs for the downloaded file."""
+    fname = pdf_filename_from_url(url)
+    for d in PDF_DIRS:
+        p = d / fname
+        if p.exists() and p.stat().st_size > 500:
+            return p
+    return None
 
-
-def extract_law_number(name: str):
-    m = re.search(r'رقم\s+(\d+)', name)
-    return m.group(1) if m else None
-
-
-def classify_doc_type(name: str) -> str:
-    if 'دستور' in name: return 'constitution'
-    if 'قرار وزاري' in name: return 'ministerial_decree'
-    if 'مرسوم' in name: return 'amiri_decree'
-    if 'اتفاقية' in name or 'اتفاق' in name: return 'international_agreement'
-    if 'لائحة' in name: return 'regulation'
-    if 'تعميم' in name: return 'circular'
-    if 'مجموعة' in name: return 'compiled_collection'
-    if 'قانون' in name: return 'law'
-    return 'other'
-
-
-def get_existing_ids() -> set:
-    """Load IDs already in corpus.jsonl to avoid duplicates."""
-    ids = set()
-    if not CORPUS_JSONL.exists():
-        return ids
-    with open(CORPUS_JSONL, 'r', encoding='utf-8') as f:
-        for line in f:
-            try:
-                ids.add(json.loads(line)['url'])
-            except Exception:
-                pass
-    return ids
-
-
-def ocr_pdf(pdf_path: Path, dpi: int) -> str:
-    """
-    Convert PDF pages to images and run Tesseract Arabic OCR.
-    Returns concatenated text from all pages.
-    """
-    # Convert PDF to list of PIL images
-    images = convert_from_path(
-        str(pdf_path),
-        dpi=dpi,
-        fmt='png',
-        thread_count=4,
-    )
-
+def ocr_pdf(pdf_path, dpi):
+    """Convert PDF pages to images and run Tesseract Arabic OCR."""
+    images = convert_from_path(str(pdf_path), dpi=dpi, fmt='png', thread_count=4)
     page_texts = []
-    for i, img in enumerate(images):
-        # Tesseract config:
-        # --oem 1  = LSTM neural net engine (best for Arabic)
-        # --psm 3  = fully automatic page segmentation (default)
-        # -l ara   = Arabic language
-        text = pytesseract.image_to_string(
-            img,
-            lang='ara',
-            config='--oem 1 --psm 3'
-        )
+    for img in images:
+        text = pytesseract.image_to_string(img, lang='ara', config='--oem 1 --psm 3')
         if text.strip():
             page_texts.append(text)
-
     return '\n\n'.join(page_texts)
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_ocr_recovery(limit=None, dpi=DEFAULT_DPI):
-    # Load failed list
-    if not FAILED_LOG.exists():
-        print("[!] output/failed.json not found. Run kuwait_legal_scraper.py first.")
-        return
+def run(limit=None, dpi=DEFAULT_DPI, dry_run=False):
 
-    with open(FAILED_LOG, 'r', encoding='utf-8') as f:
-        failed = json.load(f)
+    # ── Load corpus ───────────────────────────────────────────────────────────
+    print("[*] Loading corpus...")
+    docs = []
+    with open(CORPUS_JSONL, encoding='utf-8') as f:
+        for line in f:
+            try: docs.append(json.loads(line.strip()))
+            except: pass
 
-    # Filter to only extraction failures (not download failures)
-    # Download failures don't have a local PDF to OCR
-    to_ocr = [
-        f for f in failed
-        if f.get('error') in ('extraction_failed',)
-        and f.get('pdf')  # has a local pdf path
-    ]
-
-    # Also handle cases where pdf key is missing but file exists in pdfs/
-    for f in failed:
-        if f.get('error') == 'extraction_failed' and not f.get('pdf'):
-            # Try to find it by URL filename
-            from urllib.parse import unquote
-            fname = re.sub(r'[<>:"/\\|?*\u200b]', '_', unquote(f['url'].split('/')[-1]))
-            candidate = OUTPUT_DIR / 'pdfs' / fname
-            if candidate.exists():
-                f['pdf'] = str(candidate)
-                if f not in to_ocr:
-                    to_ocr.append(f)
+    # ── Identify targets ──────────────────────────────────────────────────────
+    targets = [d for d in docs if is_severe(d)]
+    print(f"[*] Severe docs eligible for OCR recovery: {len(targets)}")
+    print(f"[*] (skipping docs with word_count < 500 — not worth OCR-ing)\n")
 
     if limit:
-        to_ocr = to_ocr[:limit]
+        targets = targets[:limit]
 
-    existing_urls = get_existing_ids()
-    print(f"[*] {len(to_ocr)} scanned PDFs to OCR")
-    print(f"[*] DPI: {dpi}")
-    print(f"[*] Already in corpus: {len(existing_urls)} documents\n")
+    if dry_run:
+        print("DRY RUN — targets that would be processed:")
+        for d in targets:
+            url = d.get('url', '')
+            pdf = find_pdf(url)
+            status = f"PDF found: {pdf.name}" if pdf else "NO PDF FOUND"
+            print(f"  {d['id']:<18} {d.get('word_count',0):>8,}w  {status}")
+            print(f"    {d.get('name','')[:70]}")
+        return
 
+    # ── Process each target ───────────────────────────────────────────────────
     recovered   = []
-    still_failed = []
+    no_pdf      = []
+    ocr_failed  = []
+    still_bad   = []
 
-    # Count existing corpus records for ID numbering
-    existing_count = len(existing_urls)
+    for i, doc in enumerate(targets, 1):
+        doc_id = doc['id']
+        name   = doc.get('name', '')
+        url    = doc.get('url', '')
+        old_wc = doc.get('word_count', 0)
 
-    with open(CORPUS_JSONL, 'a', encoding='utf-8') as jsonl:
-        for i, item in enumerate(to_ocr, 1):
-            name     = item.get('name', 'unknown')
-            url      = item.get('url', '')
-            pdf_path = Path(item['pdf'])
+        print(f"[{i:3d}/{len(targets)}] {name[:65]}")
+        print(f"           id={doc_id}  old_words={old_wc:,}  ar={arabic_ratio(doc.get('text','')):.0%}")
 
-            print(f"[{i:3d}/{len(to_ocr)}] {name[:65]}")
+        # Find the PDF
+        pdf_path = find_pdf(url)
+        if not pdf_path:
+            print(f"           [!] PDF not found — cannot recover")
+            no_pdf.append(doc_id)
+            continue
 
-            # Skip if already in corpus
-            if url in existing_urls:
-                print(f"         [~] Already in corpus, skipping")
-                continue
+        # Run OCR
+        try:
+            raw = ocr_pdf(pdf_path, dpi=dpi)
+        except Exception as e:
+            print(f"           [!] OCR error: {e}")
+            ocr_failed.append({'id': doc_id, 'error': str(e)})
+            continue
 
-            if not pdf_path.exists():
-                print(f"         [!] PDF not found: {pdf_path}")
-                still_failed.append({**item, 'ocr_error': 'pdf_not_found'})
-                continue
+        if not raw.strip():
+            print(f"           [!] OCR returned empty text")
+            ocr_failed.append({'id': doc_id, 'error': 'empty_output'})
+            continue
 
-            # Run OCR
+        text  = clean_arabic_text(raw)
+        words = len(text.split())
+        ar    = arabic_ratio(text)
+        junk  = junk_ratio(text)
+
+        print(f"           [+] {words:,} words  ar={ar:.0%}  junk={junk:.0%}  (ocr)")
+
+        # Check OCR actually improved things
+        if ar < 0.10 and words < 500:
+            print(f"           [~] OCR didn't help much — marking as unrecoverable")
+            still_bad.append(doc_id)
+            continue
+
+        # Update the doc record in-place
+        doc['text']       = text
+        doc['word_count'] = words
+        doc['char_count'] = len(text)
+        doc['method']     = 'ocr_tesseract'
+        doc['ocr_dpi']    = dpi
+        doc['ocr_reextracted_at'] = datetime.now().isoformat()
+
+        recovered.append(doc_id)
+
+    # ── Rewrite corpus.jsonl with updated records ─────────────────────────────
+    if recovered:
+        print(f"\n[*] Rewriting corpus.jsonl with {len(recovered)} updated records...")
+        doc_map = {d['id']: d for d in docs}
+        with open(CORPUS_JSONL, 'w', encoding='utf-8') as f:
+            for d in docs:
+                f.write(json.dumps(doc_map[d['id']], ensure_ascii=False) + '\n')
+        print(f"[*] Done.")
+
+    # ── Save report ───────────────────────────────────────────────────────────
+    report = {
+        'recovered':   recovered,
+        'no_pdf':      no_pdf,
+        'ocr_failed':  ocr_failed,
+        'still_bad':   still_bad,
+        'timestamp':   datetime.now().isoformat(),
+    }
+    with open(REPORT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    # ── Final corpus stats ────────────────────────────────────────────────────
+    total_docs, total_words = 0, 0
+    with open(CORPUS_JSONL, encoding='utf-8') as f:
+        for line in f:
             try:
-                raw_text = ocr_pdf(pdf_path, dpi=dpi)
-            except Exception as e:
-                print(f"         [!] OCR error: {e}")
-                still_failed.append({**item, 'ocr_error': str(e)})
-                continue
+                d = json.loads(line)
+                total_docs  += 1
+                total_words += d.get('word_count', 0)
+            except: pass
 
-            if not raw_text.strip():
-                print(f"         [!] OCR returned empty text")
-                still_failed.append({**item, 'ocr_error': 'empty_output'})
-                continue
-
-            text       = clean_arabic_text(raw_text)
-            word_count = len(text.split())
-
-            # Flag low-confidence OCR results
-            quality = 'good' if word_count > 200 else 'low'
-            print(f"         [+] {word_count:,} words  (ocr, quality={quality})")
-
-            record = {
-                'id':           f"kw_moj_ocr_{existing_count + i:04d}",
-                'source':       'Kuwait Ministry of Justice',
-                'name':         name,
-                'url':          url,
-                'year':         extract_year(name),
-                'law_number':   extract_law_number(name),
-                'doc_type':     classify_doc_type(name),
-                'language':     'ar',
-                'jurisdiction': 'Kuwait',
-                'text':         text,
-                'word_count':   word_count,
-                'char_count':   len(text),
-                'method':       'ocr_tesseract',
-                'ocr_dpi':      dpi,
-                'ocr_quality':  quality,
-                'scraped_at':   datetime.now().isoformat(),
-            }
-
-            jsonl.write(json.dumps(record, ensure_ascii=False) + '\n')
-            jsonl.flush()
-            recovered.append({k: v for k, v in record.items() if k != 'text'})
-            existing_urls.add(url)
-
-    # Save updated failed log (only truly unrecoverable ones)
-    with open(OCR_FAILED, 'w', encoding='utf-8') as f:
-        json.dump(still_failed, f, ensure_ascii=False, indent=2)
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    total_new_words = sum(r['word_count'] for r in recovered)
-
-    print("\n" + "="*65)
-    print("  OCR RECOVERY COMPLETE")
-    print("="*65)
-    print(f"  Recovered:    {len(recovered)} documents")
-    print(f"  Still failed: {len(still_failed)} documents")
-    print(f"  New words:    {total_new_words:,}")
-    print(f"\n  Low-quality OCR results (review these):")
-    low = [r for r in recovered if r.get('ocr_quality') == 'low']
-    if low:
-        for r in low:
-            print(f"    {r['name'][:60]}  ({r['word_count']} words)")
-    else:
-        print("    None — all results look reasonable")
-    print(f"\n  Unrecoverable saved to: {OCR_FAILED}")
-    print("="*65)
-
-    # Print updated total corpus stats
-    total_words = 0
-    total_docs  = 0
-    if CORPUS_JSONL.exists():
-        with open(CORPUS_JSONL, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                    total_words += d.get('word_count', 0)
-                    total_docs  += 1
-                except Exception:
-                    pass
+    print(f"\n{'='*65}")
+    print(f"  OCR RE-EXTRACTION COMPLETE")
+    print(f"{'='*65}")
+    print(f"  Recovered (updated in corpus): {len(recovered)}")
+    print(f"  No PDF found (skip):           {len(no_pdf)}")
+    print(f"  OCR failed:                    {len(ocr_failed)}")
+    print(f"  OCR didn't help (still bad):   {len(still_bad)}")
     print(f"\n  TOTAL CORPUS NOW:")
     print(f"    Documents: {total_docs}")
     print(f"    Words:     {total_words:,}")
-    print("="*65)
+    print(f"{'='*65}")
+    print(f"\n  Full report saved to: {REPORT_FILE}")
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description='OCR recovery for scanned Arabic legal PDFs')
-    ap.add_argument('--limit', type=int, default=None, help='Process only N docs (test mode)')
-    ap.add_argument('--dpi',   type=int, default=DEFAULT_DPI, help='OCR resolution (default: 300)')
+    ap = argparse.ArgumentParser(description='OCR re-extraction for corrupted corpus docs')
+    ap.add_argument('--limit',   type=int,  default=None,  help='Process only N targets')
+    ap.add_argument('--dpi',     type=int,  default=DEFAULT_DPI, help='OCR DPI (default 300)')
+    ap.add_argument('--dry-run', action='store_true', help='Show targets without extracting')
     args = ap.parse_args()
-    run_ocr_recovery(limit=args.limit, dpi=args.dpi)
+    run(limit=args.limit, dpi=args.dpi, dry_run=args.dry_run)
