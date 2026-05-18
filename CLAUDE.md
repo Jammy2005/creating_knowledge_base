@@ -3,8 +3,9 @@
 ## What this project is
 Arabic legal corpus assembled from three Kuwaiti regulators — Central Bank of Kuwait (CBK), Capital Markets Authority (CMA), Ministry of Justice (MOJ) — to fine-tune an Arabic embedding model for legal RAG / semantic search via triplet generation.
 
-## Current state (as of 2026-05-17)
+## Current state (as of 2026-05-18)
 - `output/corpus.jsonl` — **227 docs, ~2.84M words, all extracted via Tesseract OCR**
+- `output/chunks.jsonl` — **18,905 passages**, all ≤480 tokens (XLM-R / e5-large tokenizer), 84% with parsed article numbers
 - Audit: 148 PASS, 78 WARN, 10 FAIL (FAILs are false positives on long repetitive codes)
 - All RTL-reversal issues resolved (was the dominant quality problem)
 
@@ -41,6 +42,13 @@ Failure logs are kept per source: `output/cbk_failed.json`, `output/cma_failed.j
    - `inspect_short_docs.py` — render specific IDs in full (used for triaging short docs)
 6. **Cleanup**:
    - `rid_duplicate.py` — pattern for removing specific doc IDs
+7. **Chunking** (`chunk_corpus.py`):
+   - Structural splitter on Arabic article markers (`(?:ال)?مادة` at line start, permissive lookahead for digit/ordinal nearby — OCR mangles numbers with bidi marks and mixed scripts)
+   - Recursive fallback for oversized articles (paragraph → sentence → token-window with 50-token overlap)
+   - Token-aware via `intfloat/multilingual-e5-large` tokenizer; budget 480 tokens (leaves room for `passage:` prefix)
+   - Drops chunks <20 tokens (orphan headers)
+   - Output: `output/chunks.jsonl` + `output/chunking_report.json`
+   - Spot-check viewer: `random_sample_chunks.py` (RTL-safe HTML, color-coded by chunk_method)
 
 ## Important gotchas
 
@@ -48,6 +56,7 @@ Failure logs are kept per source: `output/cbk_failed.json`, `output/cma_failed.j
 - **Audit signal triage:** treat `rtl_score`, `garbled_ratio`, and `arabic_ratio` as **load-bearing**. `lexical_diversity` and `repetition_score` fire false positives on long repetitive legal codes (civil code, penal code) — those flags do not indicate OCR failure.
 - **Always back up `corpus.jsonl` before mutating it.** The convention used in this project is `output/corpus_pre_<reason>.jsonl` (snapshot before edit).
 - **Tables lose structure under OCR.** Cell text is captured as a row-by-row stream. Acceptable for embedding/RAG use; not acceptable if structured tables are needed.
+- **`article_number` metadata is unreliable** — OCR garbles Hindu-Arabic digits and mixes scripts/bidi marks (e.g., `(مادة 5)` may actually be `(مادة ١١٥)`). The chunk *text* is correct; the metadata `article_number` is best-effort and shouldn't be used for cross-reference. Use chunk `text` as the source of truth.
 
 ## Common commands
 
@@ -56,13 +65,19 @@ Failure logs are kept per source: `output/cbk_failed.json`, `output/cma_failed.j
 .venv/bin/python corpus_audit.py
 .venv/bin/python corpus_health.py
 
-# Visual spot-check
-.venv/bin/python random_sample.py
+# Visual spot-checks
+.venv/bin/python random_sample.py         # 8 docs from corpus.jsonl
+.venv/bin/python random_sample_chunks.py  # 12 chunks from chunks.jsonl
 
-# Re-OCR (the production mode):
+# Re-OCR (production mode):
 .venv/bin/python ocr_recovery.py --select non_ocr --dry-run   # verify PDFs resolve
 .venv/bin/python ocr_recovery.py --select non_ocr --limit 5   # test sample
 .venv/bin/python ocr_recovery.py --select non_ocr             # full run
+
+# Chunking:
+.venv/bin/python chunk_corpus.py --limit 3                                    # smoke test
+.venv/bin/python chunk_corpus.py --ids kw_moj_0005,kw_cbk_0096                # specific docs
+.venv/bin/python chunk_corpus.py                                              # full run -> output/chunks.jsonl
 ```
 
 ## Backups currently in `output/`
@@ -74,4 +89,4 @@ Snapshots from past mutations, safe to delete once you're confident:
 - Older: `corpus_pre_rtlfix.jsonl`, `corpus_pre_ocr14.jsonl`, etc. — earlier passes
 
 ## Next phase
-Triplet generation from `corpus.jsonl` → fine-tune Arabic embedding model.
+Triplet generation from `chunks.jsonl` → fine-tune `intfloat/multilingual-e5-large` for Arabic legal RAG.
