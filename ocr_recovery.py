@@ -108,7 +108,7 @@ def ocr_pdf(pdf_path, dpi):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run(limit=None, dpi=DEFAULT_DPI, dry_run=False):
+def run(limit=None, dpi=DEFAULT_DPI, dry_run=False, select='severe'):
 
     # ── Load corpus ───────────────────────────────────────────────────────────
     print("[*] Loading corpus...")
@@ -119,9 +119,13 @@ def run(limit=None, dpi=DEFAULT_DPI, dry_run=False):
             except: pass
 
     # ── Identify targets ──────────────────────────────────────────────────────
-    targets = [d for d in docs if is_severe(d)]
-    print(f"[*] Severe docs eligible for OCR recovery: {len(targets)}")
-    print(f"[*] (skipping docs with word_count < 500 — not worth OCR-ing)\n")
+    selector = SELECTORS[select]
+    targets = [d for d in docs if selector(d)]
+    print(f"[*] Selector: {select}  |  targets: {len(targets)}")
+    if select == 'severe':
+        print(f"[*] (skipping docs with word_count < 500 — not worth OCR-ing)\n")
+    else:
+        print()
 
     if limit:
         targets = targets[:limit]
@@ -196,7 +200,10 @@ def run(limit=None, dpi=DEFAULT_DPI, dry_run=False):
 
     # ── Rewrite corpus.jsonl with updated records ─────────────────────────────
     if recovered:
-        print(f"\n[*] Rewriting corpus.jsonl with {len(recovered)} updated records...")
+        backup = OUTPUT_DIR / f'corpus_pre_reocr_{select}.jsonl'
+        print(f"\n[*] Backing up corpus.jsonl -> {backup.name}")
+        shutil.copy(CORPUS_JSONL, backup)
+        print(f"[*] Rewriting corpus.jsonl with {len(recovered)} updated records...")
         doc_map = {d['id']: d for d in docs}
         with open(CORPUS_JSONL, 'w', encoding='utf-8') as f:
             for d in docs:
@@ -243,5 +250,7 @@ if __name__ == '__main__':
     ap.add_argument('--limit',   type=int,  default=None,  help='Process only N targets')
     ap.add_argument('--dpi',     type=int,  default=DEFAULT_DPI, help='OCR DPI (default 300)')
     ap.add_argument('--dry-run', action='store_true', help='Show targets without extracting')
+    ap.add_argument('--select',  choices=list(SELECTORS.keys()), default='severe',
+                    help="Selector: 'severe' (default, garbled docs only) or 'non_ocr' (all non-OCR docs)")
     args = ap.parse_args()
-    run(limit=args.limit, dpi=args.dpi, dry_run=args.dry_run)
+    run(limit=args.limit, dpi=args.dpi, dry_run=args.dry_run, select=args.select)
